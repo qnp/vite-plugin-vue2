@@ -4,6 +4,48 @@ import { TransformPluginContext } from 'rollup'
 import { ResolvedOptions } from './index'
 import { createRollupError } from './utils/error'
 import { compileTemplate } from './template/compileTemplate'
+import { RawSourceMap, SourceMapGenerator } from 'source-map'
+import path from 'path'
+import fs from 'fs'
+
+const splitRE = /\r?\n/g
+const emptyRE = /^(?:\/\/)?\s*$/
+
+function generateSourceMap(
+  filename: string,
+  source: string,
+  generated: string,
+  sourceRoot: string,
+  lineOffset: number
+): RawSourceMap {
+  const map = new SourceMapGenerator({
+    file: filename.replace(/\\/g, '/'),
+    sourceRoot: sourceRoot.replace(/\\/g, '/'),
+  })
+  map.setSourceContent(filename, source)
+  generated.split(splitRE).forEach((line, index) => {
+    if (!emptyRE.test(line)) {
+      const originalLine = index + 1 + lineOffset
+      const generatedLine = index + 1
+      for (let i = 0; i < line.length; i++) {
+        if (!/\s/.test(line[i])) {
+          map.addMapping({
+            source: filename,
+            original: {
+              line: originalLine,
+              column: i,
+            },
+            generated: {
+              line: generatedLine,
+              column: i,
+            },
+          })
+        }
+      }
+    }
+  })
+  return JSON.parse(map.toString())
+}
 
 export function compileSFCTemplate(
   source: string,
@@ -11,7 +53,7 @@ export function compileSFCTemplate(
   filename: string,
   { root, isProduction, vueTemplateOptions = {}, devServer }: ResolvedOptions,
   pluginContext: TransformPluginContext
-): string {
+) {
   const { tips, errors, code } = compileTemplate({
     source,
     filename,
@@ -28,8 +70,8 @@ export function compileSFCTemplate(
     ...vueTemplateOptions,
     compilerOptions: {
       whitespace: 'condense',
-      ...(vueTemplateOptions.compilerOptions || {})
-    }
+      ...(vueTemplateOptions.compilerOptions || {}),
+    },
   })
 
   if (tips) {
@@ -63,8 +105,39 @@ export function compileSFCTemplate(
       }
     })
   }
+
+  let map
+  if (block) {
+    let content = block.content
+    if (block.src) {
+      if (path.isAbsolute(block.src)) {
+        content = fs.readFileSync(block.src, 'utf8')
+      } else {
+        content = fs.readFileSync(
+          path.join(path.dirname(filename), block.src),
+          'utf8'
+        )
+      }
+    }
+    let lineOffset = 0
+    if (!block.src && block.content) {
+      const lines = block.content.split(splitRE)
+      let count = block.start
+      for (let i = 0; i < lines.length; i++) {
+        lineOffset = i
+        count -= lines[i].length + 1
+        if (count < 0) break
+      }
+    }
+    map = generateSourceMap(filename, source, content, root, lineOffset)
+  }
+
   // rewrite require calls to import on build
-  return transformRequireToImport(code) + `\nexport { render, staticRenderFns }`
+  return {
+    code:
+      transformRequireToImport(code) + `\nexport { render, staticRenderFns }`,
+    map,
+  }
 }
 
 export function transformRequireToImport(code: string): string {
